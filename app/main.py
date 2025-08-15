@@ -184,6 +184,7 @@ async def predict_video(video_file: UploadFile = File(...)):
         tmp.write(await video_file.read())
         video_path = tmp.name
     predictions = process_video(video_path)
+    os.remove(video_path) # Clean up temp file
     return {"video_path": video_path, "predictions": predictions}
 
 @app.post("/predict-image")
