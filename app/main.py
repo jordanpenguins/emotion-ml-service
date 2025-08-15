@@ -30,7 +30,7 @@ app.add_middleware(
 def startup_event():
     print("CWD:", os.getcwd())
     global model
-    model = load_model("model/emotion_model.h5")
+    model = load_model("app/model/emotion_model.h5")
 
 
 @app.get("/")
