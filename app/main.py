@@ -43,7 +43,7 @@ def preprocess_image(file_path):
 
     file = '/content/drive/MyDrive/Pictures/image_test1.jpg'
     t_image = cv2.imread(file)
-    #img = image.load_img(file, grayscale=True, target_size=(48, 48))
+    img = image.load_img(file, grayscale=True, target_size=(48, 48))
     gray = cv2.cvtColor(t_image,cv2.COLOR_BGR2GRAY)
     faces = face_cascade.detectMultiScale(gray,1.1,4)
 
