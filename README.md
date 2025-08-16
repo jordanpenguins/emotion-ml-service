@@ -1,0 +1,1 @@
+# Emotion tagging ML service using fast api 
