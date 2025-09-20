@@ -3,6 +3,8 @@ import os
 import cv2
 import numpy as np
 import tempfile
+import requests
+from pydantic import BaseModel
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -142,6 +144,103 @@ def process_video(video_path):
     # right now we are just returning the count of each emotion rather than displaying emotion results for every second
     return dcount 
 
+def _format_seconds(seconds: int) -> str:
+    """Helper function to format seconds into HH:MM:SS string."""
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+# process video
+def process_video_timestamp(video_path):
+    """
+    
+    Expected Output: predictions = [
+                           {"start": "00:00:02", "end": "00:00:04", "emotion": "happy"},
+                            {"start": "00:00:04", "end": "00:00:06", "emotion": "sad"},
+                            {"start": "00:00:06", "end": "00:00:08", "emotion": "neutral"},
+                            {"start": "00:00:06", "end": "00:00:08", "emotion": "happy"},
+                          ]
+    """
+    count = 0
+    d = {0:"angry",1:"disgust",2:"fear",3:"happiness",4:"sad",5:"surprise",6:"neutral"}
+    predictions = []
+    
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_alt.xml')
+    cap = cv2.VideoCapture(video_path)
+    sec = 0
+    frameRate = 2 #it will capture image in each 2 second
+    current_emotion = None
+    current_start_time = 0
+
+    # Get video duration
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    duration_seconds = int(frame_count / fps) if fps > 0 else 0
+    duration_formatted = _format_seconds(duration_seconds)
+
+    while True:
+        cap.set(cv2.CAP_PROP_POS_MSEC,sec*1000)
+        hasFrames,img = cap.read()
+        if hasFrames:
+            
+            flag = 0
+            gray = cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray,1.1,4)
+
+            if(len(faces)==0):
+                detected_emotion = None
+                flag = 1
+
+            if flag == 0 :
+                detected_emotion = None 
+                # prepropessing each frame
+                count = count + 1
+                for (x,y,w,h) in faces:
+                    cv2.rectangle(gray,(x,y),(x+w,y+h),(255,0,0),2)
+                    start_row,end_row,start_col,end_col = y,y+h,x,x+h
+
+                croppedimage = gray[start_row:end_row,start_col:end_col]
+                finalimg = cv2.resize(croppedimage,(48,48))
+
+                x = image.img_to_array(finalimg)
+                x = np.expand_dims(x, axis = 0)
+                x /= 255
+                custom = model.predict(x)
+                emt = list(custom[0])
+                idx = emt.index(max(emt))
+                imgname = d[idx]
+                detected_emotion = imgname
+                if current_emotion != detected_emotion:
+                    if current_emotion is not None:
+                        predictions.append({
+                            "start": _format_seconds(current_start_time),
+                            "end": _format_seconds(sec),
+                            "emotion": current_emotion
+                        })
+                    print(f"{str(count)} {imgname} Start {_format_seconds(sec)} End {_format_seconds(sec)}")
+                    # cv2.imwrite(f"detection/frame_{count}_{current_start_time}_{sec}_{detected_emotion}.jpg", img)
+                    current_emotion = detected_emotion
+                    current_start_time = sec
+            sec = sec + frameRate
+        else:
+            break
+
+    if current_emotion is not None:
+        predictions.append({
+            "start": _format_seconds(current_start_time),
+            "end": _format_seconds(sec - frameRate),
+            "emotion": current_emotion
+        })
+        
+    cap.release()
+    return {
+        "duration_seconds": duration_seconds,
+        "duration": duration_formatted,
+        "predictions": predictions
+    }
+
 # Video model received from the backend
 def process_image(image_path):
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_alt.xml')
@@ -180,12 +279,70 @@ def process_image(image_path):
 
 @app.post("/predict-video")
 async def predict_video(video_file: UploadFile = File(...)):
+    """
+    Predict video without timestamps
+    """
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         tmp.write(await video_file.read())
         video_path = tmp.name
     predictions = process_video(video_path)
     os.remove(video_path) # Clean up temp file
     return {"video_path": video_path, "predictions": predictions}
+
+@app.post("/predict-video-timestamp")
+async def predict_video_timestamp(video_file: UploadFile = File(...)):
+    """
+    Predict video with timestamps
+
+    Expected Output: {"video_path": "path/to/uploaded/video.mp4",
+                       "predictions": [
+                           {"start": "00:00:02", "end": "00:00:04", "emotion": "happy"},
+                           {"start": "00:00:04", "end": "00:00:06", "emotion": "sad"},
+                           {"start": "00:00:06", "end": "00:00:08", "emotion": "neutral"},
+                           {"start": "00:00:06", "end": "00:00:08", "emotion": "happy"},
+                       ]
+                    }
+    """
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+        tmp.write(await video_file.read())
+        video_path = tmp.name
+    predictions = process_video_timestamp(video_path)
+    os.remove(video_path) # Clean up temp file
+    return {"video_path": video_path, "predictions": predictions}
+
+class VideoURLRequest(BaseModel):
+    video_url: str
+
+
+@app.post("/predict-video-timestamp-url")
+async def predict_video_timestamp_url(request: VideoURLRequest):
+    """
+    Predict video with timestamps from firebase storage URL
+
+    Expected Output: {"video_path": "path/to/uploaded/video.mp4",
+                       "duration": "00:00:10",
+                       "duration_seconds": 10,
+                       "predictions": [
+                           {"start": "00:00:02", "end": "00:00:04", "emotion": "happy"},
+                           {"start": "00:00:04", "end": "00:00:06", "emotion": "sad"},
+                           {"start": "00:00:06", "end": "00:00:08", "emotion": "neutral"},
+                           {"start": "00:00:06", "end": "00:00:08", "emotion": "happy"},
+                       ]
+                    }
+    """
+
+    try:
+        response = requests.get(request.video_url)
+        response.raise_for_status()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            tmp.write(response.content)
+            video_path = tmp.name
+        predictions = process_video_timestamp(video_path)
+        os.remove(video_path)  # Clean up temp file
+        return {"video_path": video_path, "predictions": predictions["predictions"], "duration": predictions["duration"], "duration_seconds": predictions["duration_seconds"]}
+    except requests.RequestException as e:
+        return {"error": str(e)}
+
 
 @app.post("/predict-image")
 async def predict_image(file: UploadFile = File(...)):
