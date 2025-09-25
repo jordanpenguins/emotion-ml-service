@@ -14,7 +14,7 @@ glocud config set project wired-name-467603-a7
 gcloud auth configure-docker asia-southeast1-docker.pkg.dev
 
 
- docker tag myimage:latest asia-southeast1-docker.pkg.dev/wired-name-467603-a7/ml-service/myimage:latest
+docker tag myimage:latest asia-southeast1-docker.pkg.dev/wired-name-467603-a7/ml-service/myimage:latest
 
 
 docker push asia-southeast1-docker.pkg.dev/wired-name-467603-a7/ml-service/myimage:latest

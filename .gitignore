@@ -1,1 +1,3 @@
 __pycache__
+detection/
+firebase_key.json
