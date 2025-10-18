@@ -6,3 +6,13 @@ opencv-python-headless
 tensorflow
 python-multipart
 pydantic
+mtcnn
+deepface
+firebase_admin
+requests
+scipy
+torch
+timm
+google-cloud-core
+google-cloud-firestore
+
