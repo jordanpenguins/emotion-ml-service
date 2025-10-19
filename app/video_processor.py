@@ -35,41 +35,41 @@ class VideoEmotionProcessor:
             'max_video_duration': 7200,  # 2 hours in seconds
         }
         
-        # Initialize Firebase with service account
-        if not firebase_admin._apps:
-            # Path to your service account key
-            cred_path = os.path.join(
-                os.path.dirname(os.path.dirname(__file__)),
-                'credentials',
-                'fyp-mcs17-firebase-adminsdk-fbsvc-78498f8376.json'
-            )
+        # # Initialize Firebase with service account
+        # if not firebase_admin._apps:
+        #     # Path to your service account key
+        #     cred_path = os.path.join(
+        #         os.path.dirname(os.path.dirname(__file__)),
+        #         'credentials',
+        #         'fyp-mcs17-firebase-adminsdk-fbsvc-78498f8376.json'
+        #     )
             
-            # Check if file exists
-            if not os.path.exists(cred_path):
-                raise FileNotFoundError(
-                    f"Firebase credentials not found at: {cred_path}\n"
-                    "Please download your service account key from Firebase Console"
-                )
+        #     # Check if file exists
+        #     if not os.path.exists(cred_path):
+        #         raise FileNotFoundError(
+        #             f"Firebase credentials not found at: {cred_path}\n"
+        #             "Please download your service account key from Firebase Console"
+        #         )
             
-            # Initialize with credentials
-            cred = credentials.Certificate(cred_path)
-            firebase_admin.initialize_app(cred, {
-                'storageBucket': 'fyp-mcs17.firebasestorage.app'  
-            })
-            logger.info(f"Firebase initialized with credentials from {cred_path}")
+        #     # Initialize with credentials
+        #     cred = credentials.Certificate(cred_path)
+        #     firebase_admin.initialize_app(cred, {
+        #         'storageBucket': 'fyp-mcs17.firebasestorage.app'  
+        #     })
+        #     logger.info(f"Firebase initialized with credentials from {cred_path}")
         
-        # Initialize Firestore and Storage
-        self.db = firestore.client()
-        self.bucket = storage.bucket()
+        # # Initialize Firestore and Storage
+        # self.db = firestore.client()
+        # self.bucket = storage.bucket()
 
-        logger.info("Firebase services initialized successfully")
+        # logger.info("Firebase services initialized successfully")
         
         # Initialize face detector
         self.face_detector = MTCNN()
         logger.info("MTCNN face detector initialized")
         
         # Initialize emotion model
-        model_path = os.environ.get('EVA_MODEL_PATH', '/Users/leezhiwin/emotion-ml-service/app/model/emotion_model.pth')
+        model_path = os.path.join("app", "model", "emotion_model.pth")
         self.emotion_model = EmotionModelHandler(model_path, self.config['num_classes'])
         
         # Session storage for tracking progress
