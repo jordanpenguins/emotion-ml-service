@@ -1,67 +1,39 @@
-# FROM python:3.9
+# Use an official NVIDIA CUDA base image (CUDA 12.8.0, cuDNN 9 runtime) with Ubuntu 24.04
+FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04
 
+# Set environment variables to ensure Python uses UTF-8 and is unbuffered
+ENV LANG C.UTF-8
+ENV LC_ALL C.UTF-8
+ENV PYTHONUNBUFFERED 1
 
-# WORKDIR /code
-
-
-# COPY ./requirements.txt /code/requirements.txt
-
-
-# RUN pip install --no-cache-dir --upgrade -r /code/requirements.txt
-
-
-# COPY ./app /code/app
-
-# EXPOSE 8080
-
-# CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
-
-FROM python:3.9-slim
-
-WORKDIR /app
-
-# Install system dependencies - More comprehensive list
+# Install Python 3.12, pip, and required system libraries for OpenCV
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 \
+    python3-pip \
     libgl1 \
     libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender1 \
-    libgomp1 \
-    libgthread-2.0-0 \
-    libopencv-dev \
-    python3-opencv \
-    wget \
-    ca-certificates \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install Python dependencies
-COPY requirements.txt .
+# Set the working directory inside the container
+WORKDIR /app
 
-# Upgrade pip and install Python packages
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+# Copy the requirements file first to leverage Docker layer caching
+COPY docker_requirements.txt .
 
-# Copy application code
-COPY app/ /app/
+# Install the CUDA-enabled version of PyTorch first
+# This must match the CUDA version from the base image (12.8.0)
+RUN python3.12 -m pip install --no-cache-dir --break-system-packages torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
-# Create directories
-RUN mkdir -p /app/model /tmp
+# Install the rest of the dependencies from your requirements file
+# Note: Ensure torch, torchvision, and torchaudio are REMOVED from requirements.txt
+RUN python3.12 -m pip install --no-cache-dir --break-system-packages -r docker_requirements.txt
 
-# Set environment variables
-ENV PYTHONUNBUFFERED=1
-ENV EVA_MODEL_PATH=/app/model/emotion_model.pth
-ENV PORT=8080
-ENV DEBIAN_FRONTEND=noninteractive
+# Copy your entire application code into the current working directory (/app)
+COPY ./app .
 
-# Expose port
+# Expose the port the container will run on
 EXPOSE 8080
 
-# Health check
-HEALTHCHECK --interval=60s --timeout=30s --start-period=180s --retries=3 \
-  CMD python -c "import requests; requests.get('http://localhost:8080/', timeout=10)" || exit 1
-
-# Run application
-CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1 --timeout-keep-alive 7200 --timeout-graceful-shutdown 300 --limit-concurrency 5 --limit-max-requests 100"]
-
+# Command to run the application using the installed python3.11
+CMD ["python3.12", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]

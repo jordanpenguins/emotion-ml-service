@@ -69,7 +69,7 @@ class VideoEmotionProcessor:
         logger.info("MTCNN face detector initialized")
         
         # Initialize emotion model
-        model_path = os.path.join("app", "model", "emotion_model.pth")
+        model_path = os.path.join("model", "emotion_model.pth")
         self.emotion_model = EmotionModelHandler(model_path, self.config['num_classes'])
         
         # Session storage for tracking progress
