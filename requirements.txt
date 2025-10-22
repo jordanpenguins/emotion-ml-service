@@ -1,18 +1,30 @@
 fastapi[standard]
 uvicorn[standard]
-numpy
-pillow
 opencv-python-headless
 tensorflow
 python-multipart
 pydantic
-mtcnn
-deepface
 firebase_admin
 requests
-scipy
-torch
 timm
 google-cloud-core
 google-cloud-firestore
+
+# Core ML
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.30.0
+
+# Computer Vision
+opencv-python>=4.8.0
+pillow>=10.0.0
+mtcnn>=0.1.1
+deepface>=0.0.79
+
+# Scientific
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Utilities
+python-dotenv>=1.0.0
 

@@ -1,28 +1,120 @@
+# video_processor.py - Updated for ViT-Large model
+
 import os
 import cv2
 import numpy as np
 import tempfile
-import requests
-from typing import Dict, List, Tuple, Optional
-from PIL import Image
+import logging
+from typing import Dict, List, Optional, Tuple
 from mtcnn import MTCNN
 from deepface import DeepFace
 from scipy.spatial.distance import cosine
-import logging
-from model_handler import EmotionModelHandler
-import time
-from datetime import datetime
-import firebase_admin
-from firebase_admin import credentials, firestore, storage
+from PIL import Image
+import torch
+from transformers import ViTForImageClassification, ViTImageProcessor
 
 logger = logging.getLogger(__name__)
 
+
+class ViTEmotionModel:
+    """Handler for ViT-Large emotion detection model"""
+    
+    def __init__(self, model_path: str):
+        """
+        Initialize ViT emotion model
+        
+        Args:
+            model_path: Path to the fine-tuned ViT model directory
+        """
+        logger.info(f"Loading ViT model from: {model_path}")
+        
+        # Device setup
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        logger.info(f"Using device: {self.device}")
+        
+        # Load model and processor
+        try:
+            self.model = ViTForImageClassification.from_pretrained(model_path)
+            self.processor = ViTImageProcessor.from_pretrained(model_path)
+            self.model.to(self.device)
+            self.model.eval()
+            
+            # Emotion labels (from RAF-DB training)
+            self.emotions = ['Surprise', 'Fear', 'Disgust', 'Happiness', 'Sadness', 'Anger', 'Neutral']
+            
+            logger.info(f"✅ ViT model loaded successfully")
+            logger.info(f"Model device: {next(self.model.parameters()).device}")
+            logger.info(f"Emotions: {self.emotions}")
+            
+        except Exception as e:
+            logger.error(f"Failed to load ViT model: {e}")
+            raise
+    
+    def predict(self, face_image: np.ndarray) -> Dict:
+        """
+        Predict emotion from face image
+        
+        Args:
+            face_image: Face image as numpy array (BGR format from OpenCV)
+            
+        Returns:
+            Dictionary with emotion prediction and confidence scores
+        """
+        try:
+            # Convert BGR to RGB
+            if len(face_image.shape) == 3 and face_image.shape[2] == 3:
+                face_rgb = cv2.cvtColor(face_image, cv2.COLOR_BGR2RGB)
+            else:
+                face_rgb = face_image
+            
+            # Convert to PIL Image
+            pil_image = Image.fromarray(face_rgb)
+            
+            # Preprocess with ViT processor
+            inputs = self.processor(images=pil_image, return_tensors='pt')
+            pixel_values = inputs['pixel_values'].to(self.device)
+            
+            # Predict
+            with torch.no_grad():
+                outputs = self.model(pixel_values)
+                probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
+                predicted_class = torch.argmax(probs).item()
+                confidence = probs[0][predicted_class].item()
+            
+            # Get all emotion probabilities
+            all_emotions = {
+                emotion: round(probs[0][i].item(), 4)
+                for i, emotion in enumerate(self.emotions)
+            }
+            
+            predicted_emotion = self.emotions[predicted_class]
+            
+            return {
+                'emotion': predicted_emotion,
+                'confidence': confidence,
+                'all_emotions': all_emotions
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in prediction: {e}")
+            # Return default response on error
+            return {
+                'emotion': 'Neutral',
+                'confidence': 0.0,
+                'all_emotions': {emotion: 0.0 for emotion in self.emotions}
+            }
 
 
 class VideoEmotionProcessor:
     """Main processor for video emotion analysis - Optimized for 2-hour videos"""
     
-    def __init__(self):
+    def __init__(self, model_path: str = None):
+        """
+        Initialize video processor
+        
+        Args:
+            model_path: Path to ViT model directory (default from environment)
+        """
         # Configuration
         self.config = {
             'match_threshold': 0.4,
@@ -31,121 +123,35 @@ class VideoEmotionProcessor:
             'face_detection_confidence': 0.9,
             'facenet_model': 'Facenet512',
             'num_classes': 7,
-            'batch_save_size': 50,  # Save to Firebase every 50 records for long videos
             'max_video_duration': 7200,  # 2 hours in seconds
+            
+            # Temporal smoothing settings 
+            'use_temporal_smoothing': True,
+            'smoothing_window_size': 5,      # 5 frames 
+            'smoothing_method': 'weighted',  # Use Gaussian weights
+            'gaussian_sigma': 1.0,           # Controls weight distribution
         }
-        
-        # Initialize Firebase with service account
-        if not firebase_admin._apps:
-            # Path to your service account key
-            cred_path = os.path.join(
-                os.path.dirname(os.path.dirname(__file__)),
-                'credentials',
-                'fyp-mcs17-firebase-adminsdk-fbsvc-78498f8376.json'
-            )
-            
-            # Check if file exists
-            if not os.path.exists(cred_path):
-                raise FileNotFoundError(
-                    f"Firebase credentials not found at: {cred_path}\n"
-                    "Please download your service account key from Firebase Console"
-                )
-            
-            # Initialize with credentials
-            cred = credentials.Certificate(cred_path)
-            firebase_admin.initialize_app(cred, {
-                'storageBucket': 'fyp-mcs17.firebasestorage.app'  
-            })
-            logger.info(f"Firebase initialized with credentials from {cred_path}")
-        
-        # Initialize Firestore and Storage
-        self.db = firestore.client()
-        self.bucket = storage.bucket()
-
-        logger.info("Firebase services initialized successfully")
         
         # Initialize face detector
         self.face_detector = MTCNN()
         logger.info("MTCNN face detector initialized")
         
-        # Initialize emotion model
-        model_path = os.environ.get('EVA_MODEL_PATH', '/Users/leezhiwin/emotion-ml-service/app/model/emotion_model.pth')
-        self.emotion_model = EmotionModelHandler(model_path, self.config['num_classes'])
+        # Initialize ViT emotion model
+        if model_path is None:
+            model_path = os.environ.get('VIT_MODEL_PATH', './app/model/vit-large-rafdb-staged')
+        
+        self.emotion_model = ViTEmotionModel(model_path)
         
         # Session storage for tracking progress
         self.sessions = {}
         
         logger.info("VideoEmotionProcessor initialized successfully")
         logger.info(f"Max video duration supported: {self.config['max_video_duration']/3600} hours")
+        logger.info(f"Temporal smoothing: {'ENABLED (Gaussian weighted)' if self.config['use_temporal_smoothing'] else 'DISABLED'}")
+        if self.config['use_temporal_smoothing']:
+            logger.info(f"  Window size: {self.config['smoothing_window_size']} frames")
+            logger.info(f"  Method: {self.config['smoothing_method']}")
     
-    def download_file(self, url: str, filename: str, source: str = 'auto') -> str:
-        """
-        Download file from URL (supports Firebase, HTTP)
-        Optimized for large files with progress tracking
-        
-        Args:
-            url: File URL
-            filename: Local filename
-            source: 'firebase', 'http', or 'auto' to detect
-            
-        Returns:
-            Path to downloaded file
-        """
-        try:
-            # Auto-detect source
-            if source == 'auto':
-                if 'firebase' in url or 'firebasestorage' in url or url.startswith('gs://'):
-                    source = 'firebase'
-                else:
-                    source = 'http'
-            
-            logger.info(f"Downloading {filename} from {source}: {url[:100]}...")
-            
-            # Download using HTTP (works for Firebase signed URLs)
-            return self._download_http(url, filename)
-            
-        except Exception as e:
-            logger.error(f"Error downloading {filename}: {e}")
-            raise
-    
-    def _download_http(self, url: str, filename: str) -> str:
-        """
-        Download file via HTTP with progress tracking
-        Optimized for large video files
-        """
-        start_time = time.time()
-        response = requests.get(url, stream=True, timeout=600)  # 10 min timeout for initial connection
-        response.raise_for_status()
-        
-        temp_file = tempfile.NamedTemporaryFile(
-            delete=False, 
-            suffix=os.path.splitext(filename)[1]
-        )
-        
-        total_size = int(response.headers.get('content-length', 0))
-        downloaded = 0
-        chunk_size = 1024 * 1024  # 1MB chunks for better performance
-        last_log_time = time.time()
-        
-        for chunk in response.iter_content(chunk_size=chunk_size):
-            temp_file.write(chunk)
-            downloaded += len(chunk)
-            
-            # Log progress every 5 seconds or every 50MB
-            current_time = time.time()
-            if (current_time - last_log_time > 5) or (downloaded % (50 * 1024 * 1024) == 0):
-                if total_size > 0:
-                    progress = (downloaded / total_size) * 100
-                    speed = downloaded / (current_time - start_time) / 1024 / 1024  # MB/s
-                    logger.info(f"Download progress: {progress:.1f}% ({downloaded / 1024 / 1024:.1f} MB) - Speed: {speed:.2f} MB/s")
-                else:
-                    logger.info(f"Downloaded: {downloaded / 1024 / 1024:.1f} MB")
-                last_log_time = current_time
-        
-        temp_file.close()
-        elapsed_time = time.time() - start_time
-        logger.info(f"Download complete: {temp_file.name} ({downloaded / 1024 / 1024:.2f} MB in {elapsed_time:.1f}s)")
-        return temp_file.name
     
     def compute_face_embedding(self, image_path: str) -> Optional[np.ndarray]:
         """
@@ -178,6 +184,7 @@ class VideoEmotionProcessor:
             logger.error(f"Error computing embedding: {e}")
             return None
     
+    
     def detect_faces(self, frame: np.ndarray) -> List[Dict]:
         """
         Detect faces in frame using MTCNN
@@ -205,6 +212,7 @@ class VideoEmotionProcessor:
                 })
         
         return faces
+    
     
     def get_face_embedding_from_frame(self, frame: np.ndarray, face_location: Tuple) -> Optional[np.ndarray]:
         """
@@ -245,6 +253,7 @@ class VideoEmotionProcessor:
             logger.debug(f"Error getting face embedding from frame: {e}")
             return None
     
+    
     def match_faces(self, embedding1: np.ndarray, embedding2: np.ndarray) -> Dict:
         """
         Compare two face embeddings
@@ -266,6 +275,7 @@ class VideoEmotionProcessor:
             'similarity': float(similarity),
             'confidence': float(similarity) if is_match else 0.0
         }
+    
     
     def identify_patient(self, detected_faces: List[Dict], frame: np.ndarray, 
                         patient_emb: np.ndarray) -> Optional[Dict]:
@@ -302,481 +312,119 @@ class VideoEmotionProcessor:
         
         return best_match
     
-    def save_to_firebase_batch(self, session_id: str, emotion_data: List[Dict]) -> bool:
+    
+    def _gaussian_weights(self, window_size: int, sigma: float = None) -> List[float]:
         """
-        Save emotion analysis results to Firebase Firestore in batches
-        Optimized for large datasets from long videos
+        Generate Gaussian weights for smoothing (center has more weight)
         
         Args:
-            session_id: Session UUID
-            emotion_data: List of emotion records
+            window_size: Size of the window
+            sigma: Standard deviation for Gaussian (default from config)
             
         Returns:
-            True if successful, False otherwise
+            List of normalized weights
         """
-        try:
-            if not emotion_data:
-                logger.warning("No emotion data to save")
-                return True
-            
-            logger.info(f"Saving {len(emotion_data)} records to Firebase Firestore in batches")
-            
-            # Firestore batch write (max 500 operations per batch)
-            batch_size = 500
-            total_batches = (len(emotion_data) - 1) // batch_size + 1
-            
-            for i in range(0, len(emotion_data), batch_size):
-                batch_data = emotion_data[i:i + batch_size]
-                batch = self.db.batch()
-                
-                for data in batch_data:
-                    # Create document reference with auto-generated ID
-                    doc_ref = self.db.collection('emotion_analysis').document()
-                    
-                    # Prepare record
-                    record = {
-                        'session_id': session_id,
-                        'frame': data['frame'],
-                        'timestamp': data['timestamp'],
-                        'emotion': data['emotion'],
-                        'confidence': data['confidence'],
-                        'match_confidence': data['match_confidence'],
-                        'num_faces': data['num_faces'],
-                        'emotion_probabilities': data['all_emotions'],
-                        'created_at': firestore.SERVER_TIMESTAMP
-                    }
-                    
-                    batch.set(doc_ref, record)
-                
-                # Commit batch
-                batch.commit()
-                logger.info(f"Saved batch {i//batch_size + 1}/{total_batches} ({len(batch_data)} records)")
-            
-            logger.info(f"All {len(emotion_data)} records saved successfully to Firebase")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error saving to Firebase: {e}", exc_info=True)
-            return False
+        if sigma is None:
+            sigma = self.config['gaussian_sigma']
+        
+        center = window_size // 2
+        weights = []
+        
+        for i in range(window_size):
+            distance = abs(i - center)
+            weight = np.exp(-(distance ** 2) / (2 * sigma ** 2))
+            weights.append(weight)
+        
+        # Normalize weights to sum to 1
+        total = sum(weights)
+        weights = [w / total for w in weights]
+        
+        return weights
     
-    def save_to_firebase(self, session_id: str, emotion_data: List[Dict]) -> bool:
-        """
-        Wrapper for batch save (backward compatibility)
-        """
-        return self.save_to_firebase_batch(session_id, emotion_data)
     
-    def _get_emotion_summary(self, emotion_data: List[Dict]) -> Dict:
+    def smooth_predictions_temporal(self, predictions: List[Dict], window_size: int = 5, 
+                                   method: str = 'weighted') -> List[Dict]:
         """
-        Generate summary statistics from emotion data
+        Apply temporal smoothing to emotion predictions using Gaussian weights
         
         Args:
-            emotion_data: List of emotion records
+            predictions: List of predictions with 'emotion', 'confidence', 'all_emotions'
+            window_size: Number of frames to average (odd number recommended)
+            method: 'simple' for uniform averaging, 'weighted' for Gaussian-weighted
             
         Returns:
-            Dictionary with summary statistics
+            Smoothed predictions with more stable emotions
         """
-        if not emotion_data:
-            return {
-                'total_records': 0,
-                'emotion_distribution': {},
-                'average_confidence': 0.0,
-                'average_match_confidence': 0.0,
-                'dominant_emotion': None,
-                'emotion_percentages': {}
-            }
+        if len(predictions) < 3:
+            logger.info("Too few predictions for smoothing, returning as-is")
+            return predictions
         
-        # Count emotions
-        emotion_counts = {}
-        for data in emotion_data:
-            emotion = data['emotion']
-            emotion_counts[emotion] = emotion_counts.get(emotion, 0) + 1
+        logger.info(f"Applying temporal smoothing (window={window_size}, method={method})...")
         
-        # Calculate percentages
-        total_records = len(emotion_data)
-        emotion_percentages = {
-            emotion: round((count / total_records) * 100, 2)
-            for emotion, count in emotion_counts.items()
-        }
+        smoothed = []
         
-        # Find dominant emotion
-        dominant_emotion = max(emotion_counts.items(), key=lambda x: x[1])[0] if emotion_counts else None
-        
-        # Calculate averages
-        avg_confidence = sum(d['confidence'] for d in emotion_data) / len(emotion_data)
-        avg_match_confidence = sum(d['match_confidence'] for d in emotion_data) / len(emotion_data)
-        
-        return {
-            'total_records': total_records,
-            'emotion_distribution': emotion_counts,
-            'emotion_percentages': emotion_percentages,
-            'dominant_emotion': dominant_emotion,
-            'average_confidence': round(avg_confidence, 3),
-            'average_match_confidence': round(avg_match_confidence, 3)
-        }
-    
-    def process_video_files(self, patient_id: str, session_id: str, video_id: str,
-                           video_path: str, photo_path: str) -> Dict:
-        """
-        Process video using local file paths (for Celery task with file uploads)
-        Optimized for 2-hour videos with incremental saving and progress tracking
-        
-        Args:
-            patient_id: Patient UUID
-            session_id: Session UUID
-            video_id: Video UUID
-            video_path: Local path to video file
-            photo_path: Local path to patient photo
+        for i in range(len(predictions)):
+            # Get window indices
+            start_idx = max(0, i - window_size // 2)
+            end_idx = min(len(predictions), i + window_size // 2 + 1)
+            window = predictions[start_idx:end_idx]
             
-        Returns:
-            Dictionary with processing results
-        """
-        
-        start_time = time.time()
-        
-        # Update session status
-        self.sessions[session_id] = {
-            'status': 'processing',
-            'progress': 0,
-            'start_time': datetime.now().isoformat()
-        }
-        
-        # Save session to Firebase for persistence
-        try:
-            self.db.collection('processing_sessions').document(session_id).set({
-                'status': 'processing',
-                'progress': 0,
-                'patient_id': patient_id,
-                'video_id': video_id,
-                'start_time': firestore.SERVER_TIMESTAMP
+            # Calculate weights
+            if method == 'weighted':
+                weights = self._gaussian_weights(len(window))
+                if i == 0:
+                    logger.info(f"📊 Gaussian weights for window size {len(window)}: {[round(w, 3) for w in weights]}")
+            else:
+                weights = [1.0 / len(window)] * len(window)
+            
+            # Aggregate emotion probabilities with weights
+            emotion_sums = {}
+            
+            for pred, weight in zip(window, weights):
+                for emotion, prob in pred['all_emotions'].items():
+                    emotion_sums[emotion] = emotion_sums.get(emotion, 0) + (prob * weight)
+            
+            # Get dominant emotion after smoothing
+            dominant_emotion = max(emotion_sums.items(), key=lambda x: x[1])
+            
+            # Keep original timestamps
+            smoothed.append({
+                'start': predictions[i]['start'],
+                'end': predictions[i]['end'],
+                'emotion': dominant_emotion[0],
+                'confidence': round(dominant_emotion[1], 3),
+                'all_emotions': {k: round(v, 3) for k, v in emotion_sums.items()}
             })
-        except Exception as e:
-            logger.warning(f"Failed to save session to Firebase: {e}")
         
-        try:
-            # Validate files exist
-            if not os.path.exists(video_path):
-                raise FileNotFoundError(f"Video file not found: {video_path}")
-            
-            if not os.path.exists(photo_path):
-                raise FileNotFoundError(f"Photo file not found: {photo_path}")
-            
-            # Compute patient embedding
-            self.sessions[session_id] = {'status': 'computing_embedding', 'progress': 10}
-            logger.info("Computing patient face embedding...")
-            patient_embedding = self.compute_face_embedding(photo_path)
-            
-            if patient_embedding is None:
-                raise ValueError("Failed to compute patient embedding. Ensure face is visible in photo.")
-            
-            logger.info(f"Patient embedding computed: {patient_embedding.shape}")
-            
-            # Process video
-            self.sessions[session_id] = {'status': 'processing_video', 'progress': 20}
-            logger.info(f"Processing video from {video_path}...")
-            
-            cap = cv2.VideoCapture(video_path)
-            
-            if not cap.isOpened():
-                raise ValueError(f"Failed to open video file: {video_path}")
-            
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            duration = total_frames / fps if fps > 0 else 0
-            
-            logger.info(f"Video info: {total_frames} frames, {duration:.1f}s ({duration/60:.1f} min), {fps:.2f} FPS, {width}x{height}")
-            
-            # Check if video is too long
-            if duration > self.config['max_video_duration']:
-                logger.warning(f"Video duration ({duration:.1f}s) exceeds maximum ({self.config['max_video_duration']}s)")
-                logger.warning(f"Consider increasing frame_interval for better performance")
-            
-            emotion_data = []
-            emotion_data_buffer = []  # Buffer for incremental saving
-            frame_count = 0
-            processed_count = 0
-            patient_detected_count = 0
-            last_save_time = time.time()
-            
-            logger.info(f"Processing every {self.config['frame_interval']} frames")
-            logger.info(f"Expected samples: ~{total_frames // self.config['frame_interval']}")
-            
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                
-                # Process every N frames
-                if frame_count % self.config['frame_interval'] == 0:
-                    timestamp = frame_count / fps if fps > 0 else 0
-                    processed_count += 1
-                    
-                    # Update progress
-                    if total_frames > 0:
-                        progress = 20 + int((frame_count / total_frames) * 70)
-                        elapsed = time.time() - start_time
-                        estimated_total = elapsed / (frame_count / total_frames) if frame_count > 0 else 0
-                        remaining = estimated_total - elapsed
-                        
-                        self.sessions[session_id] = {
-                            'status': 'processing_video',
-                            'progress': progress,
-                            'processed_frames': processed_count,
-                            'total_expected': total_frames // self.config['frame_interval'],
-                            'elapsed_time': f"{elapsed/60:.1f} min",
-                            'estimated_remaining': f"{remaining/60:.1f} min" if remaining > 0 else "calculating..."
-                        }
-                        
-                        # Update Firebase every 5%
-                        if progress % 5 == 0:
-                            try:
-                                self.db.collection('processing_sessions').document(session_id).update({
-                                    'progress': progress,
-                                    'status': 'processing_video',
-                                    'processed_frames': processed_count
-                                })
-                            except:
-                                pass
-                    
-                    # Detect faces
-                    detected_faces = self.detect_faces(frame)
-                    
-                    if detected_faces:
-                        # Identify patient
-                        patient_face = self.identify_patient(detected_faces, frame, patient_embedding)
-                        
-                        if patient_face:
-                            patient_detected_count += 1
-                            
-                            # Extract face for emotion analysis
-                            top, right, bottom, left = patient_face['face_location']
-                            margin = 20
-                            h, w = frame.shape[:2]
-                            top = max(0, top - margin)
-                            left = max(0, left - margin)
-                            bottom = min(h, bottom + margin)
-                            right = min(w, right + margin)
-                            
-                            face_img = frame[top:bottom, left:right]
-                            
-                            # Skip if face is too small
-                            if face_img.shape[0] < 50 or face_img.shape[1] < 50:
-                                logger.debug(f"Face too small at frame {frame_count}, skipping")
-                                continue
-                            
-                            # Predict emotion using EVA-02
-                            emotion_result = self.emotion_model.predict(face_img)
-                            
-                            # Store result
-                            record = {
-                                'frame': frame_count,
-                                'timestamp': round(timestamp, 2),
-                                'emotion': emotion_result['emotion'],
-                                'confidence': emotion_result['confidence'],
-                                'match_confidence': patient_face['match_confidence'],
-                                'num_faces': len(detected_faces),
-                                'all_emotions': emotion_result['all_emotions']
-                            }
-                            
-                            emotion_data.append(record)
-                            emotion_data_buffer.append(record)
-                            
-                            # Incremental save for long videos (every 50 records or every 5 minutes)
-                            current_time = time.time()
-                            if len(emotion_data_buffer) >= self.config['batch_save_size'] or \
-                               (current_time - last_save_time) > 300:  # 5 minutes
-                                logger.info(f"Incremental save: {len(emotion_data_buffer)} records")
-                                if self.save_to_firebase_batch(session_id, emotion_data_buffer):
-                                    emotion_data_buffer = []  # Clear buffer after successful save
-                                    last_save_time = current_time
-                                else:
-                                    logger.warning("Incremental save failed, will retry later")
-                            
-                            # Log progress
-                            if processed_count % 100 == 0:
-                                logger.info(f"Processed {processed_count} frames | "
-                                          f"Patient detected: {patient_detected_count} ({patient_detected_count/processed_count*100:.1f}%) | "
-                                          f"Latest: {emotion_result['emotion']} ({emotion_result['confidence']:.2f}) | "
-                                          f"Progress: {frame_count/total_frames*100:.1f}%")
-                
-                frame_count += 1
-            
-            cap.release()
-            
-            processing_time = time.time() - start_time
-            logger.info(f"Video processing complete in {processing_time/60:.1f} minutes")
-            logger.info(f"Processed {processed_count} frames, detected patient in {patient_detected_count} frames")
-            
-            # Check if we detected the patient at all
-            if patient_detected_count == 0:
-                logger.warning("Patient was not detected in any frame!")
-            
-            # Save remaining buffer data
-            if emotion_data_buffer:
-                logger.info(f"Saving final batch: {len(emotion_data_buffer)} records")
-                self.sessions[session_id] = {'status': 'saving_results', 'progress': 90}
-                success = self.save_to_firebase_batch(session_id, emotion_data_buffer)
-                
-                if not success:
-                    raise Exception("Failed to save final batch to Firebase")
-            
-            # Clean up files
-            try:
-                if os.path.exists(video_path):
-                    os.unlink(video_path)
-                    logger.info(f"Cleaned up video file: {video_path}")
-                if os.path.exists(photo_path):
-                    os.unlink(photo_path)
-                    logger.info(f"Cleaned up photo file: {photo_path}")
-            except Exception as e:
-                logger.warning(f"Error cleaning up files: {e}")
-            
-            # Update final status
-            self.sessions[session_id] = {'status': 'completed', 'progress': 100}
-            
-            # Update Firebase session status
-            try:
-                self.db.collection('processing_sessions').document(session_id).update({
-                    'status': 'completed',
-                    'progress': 100,
-                    'completed_at': firestore.SERVER_TIMESTAMP,
-                    'total_records': len(emotion_data),
-                    'processing_time_minutes': round(processing_time / 60, 2)
-                })
-            except Exception as e:
-                logger.warning(f"Failed to update session status: {e}")
-            
-            # Prepare response
-            result = {
-                'success': True,
-                'session_id': session_id,
-                'patient_id': patient_id,
-                'video_id': video_id,
-                'total_records': len(emotion_data),
-                'processing_time': round(processing_time, 2),
-                'processing_time_minutes': round(processing_time / 60, 2),
-                'video_info': {
-                    'total_frames': total_frames,
-                    'duration': round(duration, 2),
-                    'duration_minutes': round(duration / 60, 2),
-                    'fps': round(fps, 2),
-                    'resolution': f"{width}x{height}",
-                    'processed_frames': processed_count,
-                    'patient_detected': patient_detected_count,
-                    'detection_rate': round(patient_detected_count / processed_count * 100, 1) if processed_count > 0 else 0,
-                    'frame_interval': self.config['frame_interval']
-                },
-                'emotion_summary': self._get_emotion_summary(emotion_data)
-            }
-            
-            logger.info(f"Processing complete: {len(emotion_data)} emotion records in {processing_time/60:.1f} minutes")
-            logger.info(f"Average processing speed: {processed_count / processing_time:.2f} frames/sec")
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error processing video: {e}", exc_info=True)
-            self.sessions[session_id] = {'status': 'error', 'progress': 0, 'error': str(e)}
-            
-            # Update Firebase with error
-            try:
-                self.db.collection('processing_sessions').document(session_id).update({
-                    'status': 'error',
-                    'error': str(e),
-                    'failed_at': firestore.SERVER_TIMESTAMP
-                })
-            except:
-                pass
-            
-            # Clean up files on error
-            try:
-                if video_path and os.path.exists(video_path):
-                    os.unlink(video_path)
-                if photo_path and os.path.exists(photo_path):
-                    os.unlink(photo_path)
-            except:
-                pass
-            
-            return {
-                'success': False,
-                'error': str(e),
-                'session_id': session_id,
-                'patient_id': patient_id,
-                'video_id': video_id
-            }
+        # Log smoothing statistics
+        original_emotions = [p['emotion'] for p in predictions]
+        smoothed_emotions = [p['emotion'] for p in smoothed]
+        changes = sum(1 for o, s in zip(original_emotions, smoothed_emotions) if o != s)
+        
+        logger.info(f"Smoothing complete: {changes}/{len(predictions)} predictions changed ({changes/len(predictions)*100:.1f}%)")
+        
+        return smoothed
     
-    def process_video(self, patient_id: str, session_id: str, 
-                     patient_photo_url: str, video_url: str,
-                     patient_photo_source: str = 'auto',
-                     video_source: str = 'auto') -> Dict:
-        """
-        Process video using URLs (downloads files first)
-        Optimized for 2-hour videos
+    
+    def _count_emotions(self, predictions: List[Dict]) -> Dict[str, int]:
+        """Count emotion distribution"""
+        counts = {}
+        for pred in predictions:
+            emotion = pred['emotion']
+            counts[emotion] = counts.get(emotion, 0) + 1
+        return counts
+    
+    
+    def _log_emotion_distribution(self, predictions: List[Dict], label: str = ""):
+        """Log emotion distribution for debugging"""
+        counts = self._count_emotions(predictions)
+        total = len(predictions)
         
-        Args:
-            patient_id: Patient UUID
-            session_id: Session UUID
-            patient_photo_url: URL to patient photo
-            video_url: URL to video
-            patient_photo_source: Source type for photo ('auto', 'firebase', 'http')
-            video_source: Source type for video ('auto', 'firebase', 'http')
-            
-        Returns:
-            Dictionary with processing results
-        """
-        
-        # Update session status
-        self.sessions[session_id] = {'status': 'downloading', 'progress': 0}
-        
-        patient_photo_path = None
-        video_path = None
-        
-        try:
-            # Download patient photo
-            logger.info("Downloading patient photo...")
-            patient_photo_path = self.download_file(
-                patient_photo_url, 
-                'patient.jpg',
-                source=patient_photo_source
-            )
-            
-            # Download video
-            logger.info("Downloading video...")
-            video_path = self.download_file(
-                video_url, 
-                'video.mp4',
-                source=video_source
-            )
-            
-            # Process using file paths
-            result = self.process_video_files(
-                patient_id=patient_id,
-                session_id=session_id,
-                video_id=session_id,  # Use session_id as video_id if not provided
-                video_path=video_path,
-                photo_path=patient_photo_path
-            )
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error in process_video: {e}", exc_info=True)
-            self.sessions[session_id] = {'status': 'error', 'progress': 0, 'error': str(e)}
-            
-            # Clean up downloaded files
-            try:
-                if patient_photo_path and os.path.exists(patient_photo_path):
-                    os.unlink(patient_photo_path)
-                if video_path and os.path.exists(video_path):
-                    os.unlink(video_path)
-            except:
-                pass
-            
-            return {
-                'success': False,
-                'error': str(e),
-                'session_id': session_id
-            }
+        logger.info(f"📊 {label} Emotion Distribution:")
+        for emotion, count in sorted(counts.items(), key=lambda x: x[1], reverse=True):
+            percentage = (count / total * 100) if total > 0 else 0
+            logger.info(f"   {emotion}: {count} ({percentage:.1f}%)")
+    
     
     def get_session_status(self, session_id: str) -> Dict:
         """
@@ -788,49 +436,19 @@ class VideoEmotionProcessor:
         Returns:
             Dictionary with status information
         """
-        # Check in-memory cache first
         if session_id in self.sessions:
             return self.sessions[session_id]
-        
-        # Check Firebase Firestore for session
-        try:
-            doc = self.db.collection('processing_sessions').document(session_id).get()
-            if doc.exists:
-                data = doc.to_dict()
-                return {
-                    'status': data.get('status', 'unknown'),
-                    'progress': data.get('progress', 0),
-                    'message': 'Session found in Firebase'
-                }
-        except Exception as e:
-            logger.error(f"Error checking session in Firebase: {e}")
-        
-        # Check if emotion analysis results exist
-        try:
-            query = self.db.collection('emotion_analysis').where('session_id', '==', session_id).limit(1)
-            results = query.stream()
-            
-            if any(results):
-                return {
-                    'status': 'completed',
-                    'progress': 100,
-                    'message': 'Session found in database'
-                }
-        except Exception as e:
-            logger.error(f"Error checking emotion records: {e}")
         
         return {
             'status': 'not_found',
             'progress': 0,
             'message': 'Session not found'
         }
-
-    # video_processor.py - Add this method to VideoEmotionProcessor class
-
+    
+    
     def process_video_simple(self, video_path: str, photo_path: str) -> Dict:
         """
-        Simplified video processing - just analyze and return predictions
-        No Firebase/Firestore saving - backend handles that
+        Simplified video processing with ViT-Large and Gaussian temporal smoothing
         
         Args:
             video_path: Local path to video file
@@ -839,9 +457,11 @@ class VideoEmotionProcessor:
         Returns:
             Dictionary with predictions and metadata
         """
-        import cv2
-        
         try:
+            logger.info("="*60)
+            logger.info("STARTING VIDEO PROCESSING WITH VIT-LARGE")
+            logger.info("="*60)
+            
             # Validate files
             if not os.path.exists(video_path):
                 raise FileNotFoundError(f"Video file not found: {video_path}")
@@ -867,7 +487,8 @@ class VideoEmotionProcessor:
             logger.info(f"Video: {total_frames} frames, {duration:.1f}s, {fps:.2f} FPS")
             logger.info(f"Processing every {self.config['frame_interval']} frames")
             
-            predictions = []
+            # Store raw predictions with ALL emotions
+            raw_predictions = []
             frame_count = 0
             processed_count = 0
             patient_detected_count = 0
@@ -892,7 +513,7 @@ class VideoEmotionProcessor:
                         if patient_face:
                             patient_detected_count += 1
                             
-                            # Extract face
+                            # Extract face with margin
                             top, right, bottom, left = patient_face['face_location']
                             margin = 20
                             h, w = frame.shape[:2]
@@ -908,40 +529,83 @@ class VideoEmotionProcessor:
                                 frame_count += 1
                                 continue
                             
-                            # Predict emotion
+                            # Predict emotion using ViT model
                             emotion_result = self.emotion_model.predict(face_img)
                             
                             # Format timestamp
                             start_time = self.format_timestamp(timestamp)
                             end_time = self.format_timestamp(timestamp + (self.config['frame_interval'] / fps))
                             
-                            # Add prediction
-                            predictions.append({
+                            # Store raw prediction with ALL emotions
+                            raw_predictions.append({
                                 "start": start_time,
                                 "end": end_time,
                                 "emotion": emotion_result['emotion'],
-                                "confidence": round(emotion_result['confidence'], 3)
+                                "confidence": round(emotion_result['confidence'], 3),
+                                "all_emotions": emotion_result['all_emotions']
                             })
                             
                             # Log progress
                             if processed_count % 100 == 0:
                                 logger.info(f"Processed {processed_count} frames | "
-                                        f"Patient detected: {patient_detected_count} | "
-                                        f"Progress: {frame_count/total_frames*100:.1f}%")
+                                          f"Patient detected: {patient_detected_count} | "
+                                          f"Progress: {frame_count/total_frames*100:.1f}%")
                 
                 frame_count += 1
             
             cap.release()
             
-            logger.info(f"Processing complete: {len(predictions)} predictions")
+            logger.info(f"Raw processing complete: {len(raw_predictions)} predictions")
             
-            # Calculate summary
-            emotion_counts = {}
-            for pred in predictions:
-                emotion = pred['emotion']
-                emotion_counts[emotion] = emotion_counts.get(emotion, 0) + 1
+            if len(raw_predictions) == 0:
+                raise ValueError("No predictions generated - patient not detected in video")
+            
+            # Log raw emotion distribution (before smoothing)
+            logger.info("")
+            self._log_emotion_distribution(raw_predictions, "BEFORE SMOOTHING")
+            
+            # Apply Gaussian temporal smoothing
+            if self.config['use_temporal_smoothing'] and len(raw_predictions) >= 3:
+                logger.info("")
+                predictions = self.smooth_predictions_temporal(
+                    raw_predictions,
+                    window_size=self.config['smoothing_window_size'],
+                    method=self.config['smoothing_method']
+                )
+                
+                # Log smoothed emotion distribution
+                logger.info("")
+                self._log_emotion_distribution(predictions, "AFTER SMOOTHING")
+            else:
+                predictions = raw_predictions
+                logger.info("Smoothing skipped (disabled or too few predictions)")
+            
+            # Calculate summary from smoothed predictions
+            emotion_counts = self._count_emotions(predictions)
+            
+            # Calculate emotion percentages
+            total = len(predictions)
+            emotion_percentages = {
+                emotion: round((count / total) * 100, 1)
+                for emotion, count in emotion_counts.items()
+            }
             
             dominant_emotion = max(emotion_counts.items(), key=lambda x: x[1])[0] if emotion_counts else None
+            
+            # Calculate average confidence
+            avg_confidence = sum(p['confidence'] for p in predictions) / len(predictions) if predictions else 0
+            
+            logger.info("")
+            logger.info("="*60)
+            logger.info("PROCESSING COMPLETE")
+            logger.info("="*60)
+            logger.info(f"Model: ViT-Large (RAF-DB fine-tuned)")
+            logger.info(f"Total predictions: {len(predictions)}")
+            logger.info(f"Dominant emotion: {dominant_emotion}")
+            logger.info(f"Average confidence: {avg_confidence:.3f}")
+            logger.info(f"Detection rate: {patient_detected_count / processed_count * 100:.1f}%")
+            logger.info(f"Smoothing: {self.config['smoothing_method']} (window={self.config['smoothing_window_size']})")
+            logger.info("="*60)
             
             return {
                 "success": True,
@@ -951,7 +615,13 @@ class VideoEmotionProcessor:
                     "total_predictions": len(predictions),
                     "dominant_emotion": dominant_emotion,
                     "emotion_distribution": emotion_counts,
-                    "detection_rate": round(patient_detected_count / processed_count * 100, 1) if processed_count > 0 else 0
+                    "emotion_percentages": emotion_percentages,
+                    "average_confidence": round(avg_confidence, 3),
+                    "detection_rate": round(patient_detected_count / processed_count * 100, 1) if processed_count > 0 else 0,
+                    "smoothing_applied": self.config['use_temporal_smoothing'],
+                    "smoothing_method": self.config['smoothing_method'],
+                    "smoothing_window": self.config['smoothing_window_size'],
+                    "model": "ViT-Large (RAF-DB)"
                 }
             }
             
@@ -961,6 +631,7 @@ class VideoEmotionProcessor:
                 "success": False,
                 "error": str(e)
             }
+    
     
     def format_timestamp(self, seconds: float) -> str:
         """Convert seconds to HH:MM:SS format"""

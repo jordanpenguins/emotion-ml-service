@@ -369,7 +369,7 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict
 import tempfile
 import requests
-from video_processor import VideoEmotionProcessor
+from app.video_processor import VideoEmotionProcessor
 from dotenv import load_dotenv
 import uvicorn
 
