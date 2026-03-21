@@ -126,7 +126,7 @@ class VideoEmotionProcessor:
             'max_video_duration': 7200,  # 2 hours in seconds
             
             # Temporal smoothing settings 
-            'use_temporal_smoothing': True,
+            'use_temporal_smoothing': False,
             'smoothing_window_size': 5,      # 5 frames 
             'smoothing_method': 'weighted',  # Use Gaussian weights
             'gaussian_sigma': 1.0,           # Controls weight distribution
@@ -564,7 +564,7 @@ class VideoEmotionProcessor:
             logger.info("")
             self._log_emotion_distribution(raw_predictions, "BEFORE SMOOTHING")
             
-            # Apply Gaussian temporal smoothing
+            #Apply Gaussian temporal smoothing
             if self.config['use_temporal_smoothing'] and len(raw_predictions) >= 3:
                 logger.info("")
                 predictions = self.smooth_predictions_temporal(
@@ -639,3 +639,352 @@ class VideoEmotionProcessor:
         minutes = int((seconds % 3600) // 60)
         secs = int(seconds % 60)
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+    def process_video_with_annotation(self, video_path: str, photo_path: str, 
+                                   output_path: str = None) -> Dict:
+        """
+        Process video and create annotated output with bounding boxes
+        """
+        cap = None
+        out = None
+        
+        try:
+            logger.info("="*60)
+            logger.info("STARTING VIDEO PROCESSING WITH ANNOTATION")
+            logger.info("="*60)
+            
+            # Validate files
+            if not os.path.exists(video_path):
+                raise FileNotFoundError(f"Video file not found: {video_path}")
+            if not os.path.exists(photo_path):
+                raise FileNotFoundError(f"Photo file not found: {photo_path}")
+            
+            # Compute patient embedding
+            logger.info("Computing patient face embedding...")
+            patient_embedding = self.compute_face_embedding(photo_path)
+            
+            if patient_embedding is None:
+                raise ValueError("Failed to compute patient embedding")
+            
+            # Open video
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                raise ValueError(f"Failed to open video: {video_path}")
+            
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = total_frames / fps if fps > 0 else 0
+            
+            logger.info(f"Video: {total_frames} frames, {duration:.1f}s, {fps:.2f} FPS")
+            logger.info(f"Resolution: {width}x{height}")
+            
+            # Setup output video writer if path provided
+            if output_path:
+                # Try different codecs in order of preference
+                codecs_to_try = [
+                    ('mp4v', '.mp4'),
+                    ('avc1', '.mp4'),
+                    ('H264', '.mp4'),
+                    ('XVID', '.avi'),
+                    ('MJPG', '.avi')
+                ]
+                
+                for codec, ext in codecs_to_try:
+                    try:
+                        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                        
+                        # Ensure output path has correct extension
+                        if not output_path.endswith(ext):
+                            output_path = os.path.splitext(output_path)[0] + ext
+                        
+                        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+                        if out is None or not out.isOpened():
+                            raise ValueError("Failed to initialize video writer with any codec")
+                        
+                        if out.isOpened():
+                            logger.info(f"✅ Video writer initialized with codec: {codec}")
+                            break
+                        else:
+                            out.release()
+                            out = None
+                    except:
+                        continue
+                
+                if out is None or not out.isOpened():
+                    raise ValueError("Failed to initialize video writer with any codec")
+                
+                logger.info(f"Output video will be saved to: {output_path}")
+            
+            # Emotion colors (BGR format for OpenCV)
+            emotion_colors = {
+                'Happiness': (0, 255, 0),    # Green
+                'Sadness': (255, 0, 0),      # Blue
+                'Anger': (0, 0, 255),        # Red
+                'Surprise': (0, 255, 255),   # Yellow
+                'Fear': (255, 0, 255),       # Magenta
+                'Disgust': (128, 0, 128),    # Purple
+                'Neutral': (255, 255, 255)   # White
+            }
+            
+            # Storage for predictions
+            raw_predictions = []
+            emotion_dict = {}
+            
+            frame_count = 0
+            processed_count = 0
+            patient_detected_count = 0
+            annotated_frames_count = 0
+            frames_written = 0
+            
+            # Tracking variables for smooth annotation
+            last_emotion = None
+            last_confidence = 0.0
+            last_face_box = None
+            frames_since_detection = 0
+            max_frames_without_detection = int(fps * 2)
+            
+            logger.info("Processing video frames...")
+            
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                # Make a copy for annotation
+                annotated_frame = frame.copy()
+                
+                timestamp = frame_count / fps if fps > 0 else 0
+                
+                # Process every N frames for emotion detection
+                if frame_count % self.config['frame_interval'] == 0:
+                    processed_count += 1
+                    
+                    # Detect faces
+                    detected_faces = self.detect_faces(frame)
+                    
+                    if detected_faces:
+                        # Identify patient
+                        patient_face = self.identify_patient(detected_faces, frame, patient_embedding)
+                        
+                        if patient_face:
+                            patient_detected_count += 1
+                            frames_since_detection = 0
+                            
+                            # Extract face with margin
+                            top, right, bottom, left = patient_face['face_location']
+                            margin = 20
+                            h, w = frame.shape[:2]
+                            top = max(0, top - margin)
+                            left = max(0, left - margin)
+                            bottom = min(h, bottom + margin)
+                            right = min(w, right + margin)
+                            
+                            face_img = frame[top:bottom, left:right]
+                            
+                            # Skip small faces
+                            if face_img.shape[0] >= 50 and face_img.shape[1] >= 50:
+                                # Predict emotion
+                                emotion_result = self.emotion_model.predict(face_img)
+                                
+                                # Update tracking variables
+                                last_emotion = emotion_result['emotion']
+                                last_confidence = emotion_result['confidence']
+                                last_face_box = (top, right, bottom, left)
+                                
+                                # Store prediction
+                                start_time = self.format_timestamp(timestamp)
+                                end_time = self.format_timestamp(timestamp + (self.config['frame_interval'] / fps))
+                                
+                                raw_predictions.append({
+                                    "start": start_time,
+                                    "end": end_time,
+                                    "emotion": emotion_result['emotion'],
+                                    "confidence": round(emotion_result['confidence'], 3),
+                                    "all_emotions": emotion_result['all_emotions']
+                                })
+                                
+                                emotion_dict[frame_count] = {
+                                    'emotion': last_emotion,
+                                    'confidence': last_confidence,
+                                    'face_box': last_face_box
+                                }
+                    
+                    # Log progress
+                    if processed_count % 50 == 0:
+                        progress = (frame_count / total_frames) * 100
+                        logger.info(f"Progress: {progress:.1f}% | Processed: {processed_count} | "
+                                f"Patient detected: {patient_detected_count} | "
+                                f"Frames written: {frames_written}")
+                
+                # ANNOTATE FRAME
+                if last_emotion and last_face_box:
+                    frames_since_detection += 1
+                    
+                    # Stop showing box if too long without detection
+                    if frames_since_detection > max_frames_without_detection:
+                        last_face_box = None
+                        last_emotion = None
+                    else:
+                        annotated_frames_count += 1
+                        top, right, bottom, left = last_face_box
+                        
+                        # Ensure coordinates are within frame bounds
+                        top = max(0, min(height - 1, top))
+                        left = max(0, min(width - 1, left))
+                        bottom = max(0, min(height - 1, bottom))
+                        right = max(0, min(width - 1, right))
+                        
+                        # Get color for emotion
+                        color = emotion_colors.get(last_emotion, (0, 255, 0))
+                        
+                        # Draw bounding box on annotated frame
+                        cv2.rectangle(annotated_frame, (left, top), (right, bottom), color, 3)
+                        
+                        # Create label
+                        label = f"{last_emotion}: {last_confidence:.2f}"
+                        label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+                        
+                        # Draw label background
+                        label_top = max(0, top - label_size[1] - 10)
+                        label_bottom = max(0, top)
+                        cv2.rectangle(annotated_frame, 
+                                    (left, label_top),
+                                    (left + label_size[0] + 10, label_bottom),
+                                    color, -1)
+                        
+                        # Draw label text
+                        text_y = max(label_size[1], top - 5)
+                        cv2.putText(annotated_frame, label, (left + 5, text_y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+                        
+                        # Add timestamp
+                        time_label = f"Time: {self.format_timestamp(timestamp)}"
+                        cv2.putText(annotated_frame, time_label, (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                
+                # Write frame to output
+                if out and out.isOpened():
+                    try:
+                        out.write(annotated_frame)
+                        frames_written += 1
+                    except Exception as e:
+                        logger.error(f"Error writing frame {frame_count}: {e}")
+                
+                frame_count += 1
+            
+            logger.info(f"Finished processing all frames. Total frames: {frame_count}")
+            logger.info(f"Frames written to output: {frames_written}")
+            
+        except Exception as e:
+            logger.error(f"Error in process_video_with_annotation: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e)
+            }
+        
+        finally:
+            # CRITICAL: Release resources properly
+            if cap:
+                cap.release()
+                logger.info("Video capture released")
+            
+            if out:
+                out.release()
+                logger.info("Video writer released")
+            
+            # Verify output file was created
+            if output_path:
+                if os.path.exists(output_path):
+                    file_size = os.path.getsize(output_path)
+                    logger.info(f"✅ Output file created: {output_path}")
+                    logger.info(f"File size: {file_size / 1024 / 1024:.2f} MB")
+                    
+                    if file_size < 1000:
+                        logger.error(f"⚠️  Output file is suspiciously small ({file_size} bytes)")
+                        return {
+                            "success": False,
+                            "error": "Output video file is too small - may be corrupted"
+                        }
+                else:
+                    logger.error(f"❌ Output file was not created: {output_path}")
+                    return {
+                        "success": False,
+                        "error": "Output video file was not created"
+                    }
+        
+        # Continue with predictions processing...
+        if len(raw_predictions) == 0:
+            return {
+                "success": False,
+                "error": "No predictions generated - patient not detected in video"
+            }
+        
+        # Log emotion distribution
+        self._log_emotion_distribution(raw_predictions, "BEFORE SMOOTHING")
+        
+        # Apply temporal smoothing
+        if self.config['use_temporal_smoothing'] and len(raw_predictions) >= 3:
+            predictions = self.smooth_predictions_temporal(
+                raw_predictions,
+                window_size=self.config['smoothing_window_size'],
+                method=self.config['smoothing_method']
+            )
+            self._log_emotion_distribution(predictions, "AFTER SMOOTHING")
+        else:
+            predictions = raw_predictions
+        
+        # Calculate summary
+        emotion_counts = self._count_emotions(predictions)
+        total = len(predictions)
+        emotion_percentages = {
+            emotion: round((count / total) * 100, 1)
+            for emotion, count in emotion_counts.items()
+        }
+        
+        dominant_emotion = max(emotion_counts.items(), key=lambda x: x[1])[0] if emotion_counts else None
+        avg_confidence = sum(p['confidence'] for p in predictions) / len(predictions) if predictions else 0
+        
+        logger.info("="*60)
+        logger.info("PROCESSING COMPLETE")
+        logger.info(f"Total predictions: {len(predictions)}")
+        logger.info(f"Dominant emotion: {dominant_emotion}")
+        logger.info(f"Frames written: {frames_written}/{frame_count}")
+        logger.info(f"Annotated coverage: {annotated_frames_count/frame_count*100:.1f}%")
+        if output_path:
+            logger.info(f"Annotated video: {output_path}")
+        logger.info("="*60)
+
+        logger.info(f"Total frames read: {frame_count}")
+        logger.info(f"Frames written: {frames_written}")
+        logger.info(f"VideoWriter is open: {out.isOpened() if out else False}")
+
+        if frames_written == 0:
+            logger.error("⚠️ NO FRAMES WERE WRITTEN TO OUTPUT!")
+
+
+        
+        return {
+            "success": True,
+            "duration_seconds": round(duration, 2),
+            "predictions": predictions,
+            "annotated_video_path": output_path if output_path else None,
+            "frames_written": frames_written,
+            "summary": {
+                "total_predictions": len(predictions),
+                "dominant_emotion": dominant_emotion,
+                "emotion_distribution": emotion_counts,
+                "emotion_percentages": emotion_percentages,
+                "average_confidence": round(avg_confidence, 3),
+                "detection_rate": round(patient_detected_count / processed_count * 100, 1) if processed_count > 0 else 0,
+                "annotated_frames": annotated_frames_count,
+                "annotation_coverage": round(annotated_frames_count / frame_count * 100, 1) if frame_count > 0 else 0,
+                "smoothing_applied": self.config['use_temporal_smoothing'],
+                "smoothing_method": self.config['smoothing_method'],
+                "smoothing_window": self.config['smoothing_window_size'],
+                "model": "ViT-Large (RAF-DB)"
+            }
+        }

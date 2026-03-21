@@ -372,6 +372,15 @@ import requests
 from app.video_processor import VideoEmotionProcessor
 from dotenv import load_dotenv
 import uvicorn
+import firebase_admin
+from firebase_admin import credentials, storage
+from fastapi import FastAPI, HTTPException, status, BackgroundTasks
+import uuid
+import subprocess
+import requests
+import tempfile
+from typing import Optional
+import tempfile
 
 load_dotenv()
 
@@ -404,6 +413,101 @@ def get_processor():
         processor = VideoEmotionProcessor()
     return processor
 
+def cleanup_files(paths):
+    """Safely delete temporary files created during processing."""
+    for path in paths:
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+                logger.info(f"🧹 Deleted temporary file: {path}")
+            except Exception as e:
+                logger.warning(f"Failed to delete {path}: {e}")
+
+
+def download_file_from_url(url: str, suffix: str = '.mp4') -> Optional[str]:
+    """
+    Download file from URL with detailed error logging
+    """
+    try:
+        logger.info(f"Downloading from URL: {url}")
+        logger.info("Making HTTP request...")
+        
+        # Add timeout and stream for large files
+        response = requests.get(url, stream=True, timeout=30)
+        response.raise_for_status()  # Raise exception for bad status codes
+        
+        logger.info(f"Response status: {response.status_code}")
+        logger.info(f"Content-Type: {response.headers.get('Content-Type')}")
+        logger.info(f"Content-Length: {response.headers.get('Content-Length')} bytes")
+        
+        # Create temporary file
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        
+        # Download with progress tracking
+        total_size = int(response.headers.get('Content-Length', 0))
+        downloaded = 0
+        
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                temp_file.write(chunk)
+                downloaded += len(chunk)
+                
+                # Log progress every 10%
+                if total_size > 0 and downloaded % (total_size // 10) < 8192:
+                    progress = (downloaded / total_size) * 100
+                    logger.info(f"Download progress: {progress:.1f}%")
+        
+        temp_file.close()
+        
+        file_size = os.path.getsize(temp_file.name)
+        logger.info(f"✅ Download complete: {temp_file.name} ({file_size / 1024 / 1024:.2f} MB)")
+        
+        return temp_file.name
+        
+    except requests.exceptions.Timeout:
+        logger.error(f"❌ Timeout error downloading from URL: {url}")
+        return None
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"❌ Connection error: {e}")
+        return None
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"❌ HTTP error: {e}")
+        logger.error(f"Response text: {response.text[:500]}")  # First 500 chars
+        return None
+    except Exception as e:
+        logger.error(f"❌ Unexpected error downloading file: {e}", exc_info=True)
+        return None
+
+def create_annotated_video_with_ffmpeg(input_path: str, output_path: str) -> bool:
+        """
+        Re-encode video with FFmpeg for better compatibility
+        """
+        try:
+            cmd = [
+                'ffmpeg',
+                '-i', input_path,
+                '-vcodec', 'libx264',
+                '-acodec', 'aac',
+                '-strict', 'experimental',
+                '-b:v', '2000k',
+                '-y',  # Overwrite output
+                output_path
+            ]
+            
+            logger.info(f"Re-encoding with FFmpeg: {' '.join(cmd)}")
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            
+            if result.returncode == 0:
+                logger.info("✅ FFmpeg encoding successful")
+                return True
+            else:
+                logger.error(f"FFmpeg error: {result.stderr}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"FFmpeg encoding failed: {e}")
+            return False
 
 @app.on_event("startup")
 async def startup_event():
@@ -414,6 +518,26 @@ async def startup_event():
         logger.info("Video processor initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize video processor: {e}")
+        raise
+
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        key_path = os.path.join(base_dir, "firebase_key.json")
+
+        if not os.path.exists(key_path):
+            raise FileNotFoundError(f"Firebase key not found at {key_path}")
+
+        if not firebase_admin._apps:
+            cred = credentials.Certificate(key_path)
+            firebase_admin.initialize_app(cred, {
+                'storageBucket': 'ai-emotion-tagging.firebasestorage.app'
+            })
+            logger.info("Firebase initialized successfully")
+        else:
+            logger.info("Firebase already initialized")
+
+    except Exception as e:
+        logger.error(f"Failed to initialize Firebase: {e}")
         raise
 
 
@@ -584,6 +708,150 @@ async def analyze_video(request: VideoURLRequest):
             detail=f"Processing error: {str(e)}"
         )
 
+def upload_to_firebase_storage(local_path: str, destination_name: str) -> str:
+    """Upload file to Firebase Storage and return public URL"""
+    try:
+        # Verify file exists and has content
+        if not os.path.exists(local_path):
+            raise FileNotFoundError(f"File not found: {local_path}")
+        
+        file_size = os.path.getsize(local_path)
+        logger.info(f"Uploading file: {local_path} ({file_size / 1024 / 1024:.2f} MB)")
+        
+        if file_size < 1000:
+            raise ValueError(f"File is too small ({file_size} bytes) - likely corrupted")
+        
+        bucket = storage.bucket()
+        blob = bucket.blob(f"annotated_videos/{destination_name}")
+        
+        # Upload with content type
+        blob.upload_from_filename(
+            local_path,
+            content_type='video/mp4'
+        )
+        
+        # Make public
+        blob.make_public()
+        
+        public_url = blob.public_url
+        logger.info(f"✅ File uploaded successfully: {public_url}")
+        
+        return public_url
+        
+    except Exception as e:
+        logger.error(f"Error uploading to Firebase: {e}")
+        raise
+
+
+@app.post("/analyze-with-video-upload")
+async def analyze_and_upload_video(request: VideoURLRequest, background_tasks: BackgroundTasks):
+    """
+    Analyze video, create annotated version, and upload to Firebase Storage
+    Returns predictions + URL to annotated video
+    """
+    video_path = None
+    photo_path = None
+    output_path = None
+    
+    try:
+        logger.info("="*60)
+        logger.info("Starting video analysis")
+        logger.info(f"Video URL: {request.video_url[:80]}...")
+        logger.info(f"Photo URL: {request.patient_photo_url[:80]}...")
+        logger.info(f"Frame interval: {request.frame_interval}")
+        logger.info("="*60)
+        
+        # Validate frame_interval
+        if request.frame_interval < 1 or request.frame_interval > 300:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="frame_interval must be between 1 and 300"
+            )
+        
+        # Download video
+        logger.info("Downloading video...")
+        try:
+            logger.info("Downloading video...")
+            response = requests.get(request.video_url, stream=True, timeout=600)
+            response.raise_for_status()
+        except Exception as e:
+            import traceback
+            logger.error(f"❌ Video download failed: {e}\n{traceback.format_exc()}")
+            raise HTTPException(status_code=500, detail=f"Video download failed: {e}")
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_video:
+            total_size = 0
+            for chunk in response.iter_content(chunk_size=8192):
+                tmp_video.write(chunk)
+                total_size += len(chunk)
+            video_path = tmp_video.name
+        
+        logger.info(f"Video downloaded: {total_size / 1024 / 1024:.2f} MB")
+        
+        # Download patient photo
+        logger.info("Downloading patient photo...")
+        response = requests.get(request.patient_photo_url, timeout=60)
+        response.raise_for_status()
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_photo:
+            tmp_photo.write(response.content)
+            photo_path = tmp_photo.name
+        
+        logger.info(f"Photo downloaded: {len(response.content) / 1024:.2f} KB")
+        
+        output_filename = f"annotated_{uuid.uuid4()}.mp4"
+        output_path = tempfile.mktemp(suffix=".mp4")
+
+        # Get processor
+        proc = get_processor()
+        
+        # Set frame interval
+        original_frame_interval = proc.config['frame_interval']
+        proc.config['frame_interval'] = request.frame_interval
+        
+        # Process video - simplified version that doesn't save to Firebase
+        logger.info("Processing video...")
+        result = proc.process_video_with_annotation(video_path, photo_path, output_path)
+
+        upload_local_path = result.get("annotated_video_path") or output_path
+
+        # pick a new temp path for the re-encoded file
+        fixed_path = os.path.join(
+            os.path.dirname(upload_local_path),
+            f"fixed_{uuid.uuid4()}.mp4"
+        )
+
+        # try to re-encode
+        ok = create_annotated_video_with_ffmpeg(upload_local_path, fixed_path)
+
+        # choose which file to upload
+        file_to_upload = fixed_path if ok and os.path.exists(fixed_path) else upload_local_path
+        
+        # Restore frame interval
+        proc.config['frame_interval'] = original_frame_interval
+        
+        logger.info("="*60)
+        logger.info("Processing complete!")
+        logger.info(f"Total predictions: {len(result.get('predictions', []))}")
+        logger.info("="*60)
+        
+        
+        if result['success'] and os.path.exists(output_path):
+            # Upload to Firebase Storage
+            logger.info("Uploading annotated video to Firebase Storage...")
+            annotated_url = upload_to_firebase_storage(file_to_upload, f"annotated_{uuid.uuid4()}.mp4")
+            
+            result['annotated_video_url'] = annotated_url
+            logger.info(f"✅ Annotated video uploaded: {annotated_url}")
+        
+        # Schedule cleanup
+        background_tasks.add_task(cleanup_files, [video_path, photo_path, output_path])
+        
+        return result
+        
+    except Exception as e:
+        cleanup_files([video_path, photo_path, output_path])
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
